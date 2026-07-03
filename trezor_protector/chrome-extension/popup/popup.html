@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="shield">🛡</span>
+    <span>TrezorProtector</span>
+  </div>
+  <button id="lock-btn" class="ghost hidden" title="Lock vault">Lock</button>
+</header>
+
+<!-- Host not installed -->
+<section id="view-install" class="view hidden">
+  <h2>Native host not found</h2>
+  <p>The extension talks to your Trezor through a small local program.</p>
+  <ol>
+    <li>Build it: <code>cargo build --release</code></li>
+    <li>Register it:<br><code>tp-host install --extension-id &lt;this extension's id&gt;</code></li>
+    <li>Reload this popup.</li>
+  </ol>
+  <p class="dim">Find the id at <code>chrome://extensions</code> (Developer mode).</p>
+</section>
+
+<!-- Save-password banner (shown in any view when credentials were captured) -->
+<div id="save-banner" class="hidden">
+  <p id="save-text"></p>
+  <div class="pin-row">
+    <button id="save-yes" class="primary">Save to vault</button>
+    <button id="save-no" class="ghost">Not now</button>
+  </div>
+  <p id="save-status" class="dim center-note"></p>
+</div>
+
+<!-- Locked -->
+<section id="view-locked" class="view hidden">
+  <p class="center-note">Vault is locked.<br>Unlocking requires a confirmation on your Trezor.</p>
+  <button id="unlock-btn" class="primary big">Unlock with Trezor</button>
+  <p id="unlock-status" class="dim center-note"></p>
+
+  <div id="pin-panel" class="hidden">
+    <p>Enter your PIN using the <b>positions shown on the device</b>:</p>
+    <div class="pin-grid">
+      <button data-pos="7">•</button><button data-pos="8">•</button><button data-pos="9">•</button>
+      <button data-pos="4">•</button><button data-pos="5">•</button><button data-pos="6">•</button>
+      <button data-pos="1">•</button><button data-pos="2">•</button><button data-pos="3">•</button>
+    </div>
+    <div class="pin-row">
+      <span id="pin-dots" class="pin-dots"></span>
+      <button id="pin-back" class="ghost">⌫</button>
+    </div>
+    <div class="pin-row">
+      <button id="pin-submit" class="primary">Confirm PIN</button>
+      <button id="pin-cancel" class="ghost">Cancel</button>
+    </div>
+  </div>
+
+  <div id="passphrase-panel" class="hidden">
+    <p>Passphrase requested.</p>
+    <button id="pp-on-device" class="primary">Enter on device (recommended)</button>
+    <div class="pin-row">
+      <input id="pp-input" type="password" placeholder="…or type it here">
+      <button id="pp-submit" class="ghost">Use</button>
+    </div>
+  </div>
+</section>
+
+<!-- Unlocked -->
+<section id="view-main" class="view hidden">
+  <input id="search" type="search" placeholder="Search vault…" autocomplete="off">
+  <div id="entries"></div>
+
+  <details id="generator">
+    <summary>Password generator</summary>
+    <div class="gen-row">
+      <label>Length <input id="gen-length" type="number" min="8" max="64" value="20"></label>
+      <label><input id="gen-symbols" type="checkbox" checked> symbols</label>
+      <label><input id="gen-passphrase" type="checkbox"> passphrase</label>
+    </div>
+    <div class="gen-row">
+      <output id="gen-output"></output>
+    </div>
+    <div class="gen-row">
+      <button id="gen-new" class="ghost">Generate</button>
+      <button id="gen-copy" class="primary">Copy</button>
+      <span id="gen-bits" class="dim"></span>
+    </div>
+  </details>
+
+  <footer>
+    <span id="entry-count" class="dim"></span>
+    <label class="dim">Auto-lock
+      <select id="autolock">
+        <option value="1">1 min</option>
+        <option value="5" selected>5 min</option>
+        <option value="15">15 min</option>
+        <option value="60">1 h</option>
+      </select>
+    </label>
+  </footer>
+</section>
+
+<div id="toast" class="hidden"></div>
+<div id="confirm-overlay" class="hidden">
+  <div class="confirm-box">
+    <p id="confirm-text"></p>
+    <div class="pin-row">
+      <button id="confirm-yes" class="primary">Fill anyway</button>
+      <button id="confirm-no" class="ghost">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# Rust
+trezor_protector/rust/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Vaults & secrets — never commit these
+vault.json
+vault.json.bak
+*.tpbackup
+*.tpenc
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
+*.tmp

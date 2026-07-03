@@ -1,0 +1,23 @@
+[package]
+name = "tp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TrezorProtector core: crypto, vault, file encryption, TOTP, Trezor device access"
+
+[dependencies]
+aes-gcm.workspace = true
+zeroize.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+base32.workspace = true
+rand.workspace = true
+argon2.workspace = true
+time.workspace = true
+trezor-client.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "tp-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TrezorProtector command-line interface"
+
+[[bin]]
+name = "tp"
+path = "src/main.rs"
+
+[dependencies]
+tp-core = { path = "../tp-core" }
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+arboard = "3"
+zeroize.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+ureq = { version = "2", features = ["tls"] }
+sha1.workspace = true
+colored = "2"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
