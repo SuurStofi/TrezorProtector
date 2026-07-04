@@ -4,13 +4,67 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, RichText};
 use tp_core::passwords::{self, GenerateOptions};
+use tp_core::settings::Settings;
 use tp_core::totp::Totp;
 use tp_core::vault::Entry;
 
 use crate::worker::{self, Cmd, Event, Reply, WorkerHandle};
 
-const AUTO_LOCK: Duration = Duration::from_secs(5 * 60);
 const ACCENT: Color32 = Color32::from_rgb(39, 176, 108);
+
+/// A small deterministic palette for the generated site tiles.
+const TILE_COLORS: [Color32; 8] = [
+    Color32::from_rgb(39, 176, 108),
+    Color32::from_rgb(70, 130, 220),
+    Color32::from_rgb(200, 120, 40),
+    Color32::from_rgb(170, 90, 200),
+    Color32::from_rgb(210, 80, 100),
+    Color32::from_rgb(40, 170, 180),
+    Color32::from_rgb(150, 150, 60),
+    Color32::from_rgb(110, 110, 200),
+];
+
+/// Registrable-ish label + first letter for an entry's icon tile.
+fn site_label(entry: &Entry) -> (char, Color32) {
+    let basis = if !entry.url.is_empty() { &entry.url } else { &entry.name };
+    let host = basis
+        .rsplit("://")
+        .next()
+        .unwrap_or(basis)
+        .trim_start_matches("www.");
+    let ch = host
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .unwrap_or('?')
+        .to_ascii_uppercase();
+    let mut h: u32 = 2166136261;
+    for b in host.bytes() {
+        h = (h ^ b as u32).wrapping_mul(16777619);
+    }
+    (ch, TILE_COLORS[(h as usize) % TILE_COLORS.len()])
+}
+
+fn trunc(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
+fn draw_tile(ui: &mut egui::Ui, ch: char, color: Color32) {
+    let size = egui::vec2(22.0, 22.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().rect_filled(rect, 5.0, color);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        ch,
+        egui::FontId::proportional(13.0),
+        Color32::WHITE,
+    );
+}
 
 #[derive(Default)]
 enum Modal {
@@ -27,6 +81,7 @@ enum Modal {
         id: String,
         name: String,
     },
+    Settings,
 }
 
 #[derive(Default, Clone)]
@@ -58,6 +113,7 @@ pub struct ManagerApp {
     gen_passphrase: bool,
     gen_output: String,
     last_activity: Instant,
+    settings: Settings,
 }
 
 impl ManagerApp {
@@ -78,6 +134,7 @@ impl ManagerApp {
             gen_passphrase: false,
             gen_output: String::new(),
             last_activity: Instant::now(),
+            settings: Settings::load_default(),
         }
     }
 
@@ -189,7 +246,7 @@ impl ManagerApp {
         ui.add_space(6.0);
 
         let query = self.search.to_lowercase();
-        let ids: Vec<(String, String, String)> = self
+        let ids: Vec<Entry> = self
             .entries
             .iter()
             .filter(|e| {
@@ -198,18 +255,27 @@ impl ManagerApp {
                     || e.username.to_lowercase().contains(&query)
                     || e.url.to_lowercase().contains(&query)
             })
-            .map(|e| (e.id.clone(), e.name.clone(), e.username.clone()))
+            .cloned()
             .collect();
 
+        let show_icons = self.settings.show_site_icons;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (id, name, username) in ids {
-                let selected = self.selected.as_deref() == Some(id.as_str());
-                let label = egui::SelectableLabel::new(
-                    selected,
-                    format!("{name}\n    {username}"),
-                );
-                if ui.add(label).clicked() {
-                    self.selected = Some(id.clone());
+            for entry in ids {
+                let selected = self.selected.as_deref() == Some(entry.id.as_str());
+                let resp = ui.horizontal(|ui| {
+                    if show_icons {
+                        let (ch, color) = site_label(&entry);
+                        draw_tile(ui, ch, color);
+                    }
+                    ui.add(
+                        egui::SelectableLabel::new(
+                            selected,
+                            format!("{}\n    {}", trunc(&entry.name, 26), trunc(&entry.username, 28)),
+                        ),
+                    )
+                });
+                if resp.inner.clicked() {
+                    self.selected = Some(entry.id.clone());
                     self.reveal = false;
                     self.form = None;
                 }
@@ -449,7 +515,7 @@ impl ManagerApp {
     }
 
     fn tools_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("🔒 Encrypt file…").clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
                     let _ = self.worker.cmd_tx.send(Cmd::EncryptFile(path));
@@ -587,6 +653,71 @@ impl ManagerApp {
                         });
                     });
             }
+            Modal::Settings => {
+                let mut changed = false;
+                let mut s = self.settings.clone();
+                egui::Window::new("⚙ Settings")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.set_min_width(340.0);
+                        changed |= ui
+                            .checkbox(&mut s.pin_every_operation, "Require device confirmation for every reveal / copy")
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut s.lock_on_disconnect, "Lock immediately when the Trezor is unplugged")
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut s.relock_after_manual_lock, "Require unlock again after a manual Lock")
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut s.screen_capture_protection, "Anti-RAT: exclude windows from screen capture")
+                            .changed();
+                        changed |= ui
+                            .checkbox(&mut s.show_site_icons, "Show site icon tiles")
+                            .changed();
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Auto-lock after (minutes, 0 = never):");
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut s.auto_lock_minutes).range(0..=240))
+                                .changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Clipboard auto-clear (seconds, 0 = never):");
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut s.clipboard_clear_seconds).range(0..=600))
+                                .changed();
+                        });
+
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(
+                                "Recovery phrase (for re-binding a new Trezor) is managed from the CLI: `tp vault recovery-setup`.",
+                            )
+                            .weak()
+                            .size(11.0),
+                        );
+                        if s.screen_capture_protection {
+                            ui.label(
+                                RichText::new("Screen-capture protection applies on next launch.")
+                                    .weak()
+                                    .size(11.0),
+                            );
+                        }
+
+                        ui.add_space(8.0);
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                if changed {
+                    self.settings = s;
+                    let _ = self.settings.save_default();
+                }
+            }
         }
 
         if let Some(reply) = reply {
@@ -612,7 +743,8 @@ impl eframe::App for ManagerApp {
         }
         if self.unlocked {
             ctx.request_repaint_after(Duration::from_secs(1));
-            if self.last_activity.elapsed() > AUTO_LOCK {
+            let minutes = self.settings.auto_lock_minutes;
+            if minutes > 0 && self.last_activity.elapsed() > Duration::from_secs(minutes * 60) {
                 let _ = self.worker.cmd_tx.send(Cmd::Lock);
             }
         }
@@ -621,10 +753,15 @@ impl eframe::App for ManagerApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("🛡 TrezorProtector").strong().size(15.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⚙").on_hover_text("Settings").clicked() {
+                        self.modal = Modal::Settings;
+                    }
                     if self.unlocked && ui.button("🔒 Lock").clicked() {
                         let _ = self.worker.cmd_tx.send(Cmd::Lock);
                     }
-                    ui.label(RichText::new(&self.status.0).color(self.status.1));
+                    ui.add(egui::Label::new(
+                        RichText::new(&self.status.0).color(self.status.1),
+                    ).truncate());
                 });
             });
         });
@@ -636,15 +773,20 @@ impl eframe::App for ManagerApp {
                 ui.add_space(4.0);
             });
             egui::SidePanel::left("list")
-                .default_width(240.0)
-                .min_width(200.0)
+                .resizable(true)
+                .default_width(250.0)
+                .width_range(190.0..=360.0)
                 .show(ctx, |ui| {
                     ui.add_space(6.0);
                     self.entry_list(ui);
                 });
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.add_space(6.0);
-                self.details_panel(ui);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.details_panel(ui);
+                    });
             });
         } else {
             egui::CentralPanel::default().show(ctx, |ui| self.locked_view(ui));

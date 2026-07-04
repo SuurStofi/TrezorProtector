@@ -1,11 +1,11 @@
 //! TrezorProtector desktop UI.
 //!
 //! Modes:
-//!  * `tp-gui`             — full vault manager window
-//!  * `tp-gui pin`         — PIN-matrix dialog (used by tp-host); prints
-//!                           the selected positions to stdout
-//!  * `tp-gui passphrase`  — passphrase dialog (empty line = on-device)
-//!  * `tp-gui connect`     — "connect your Trezor" retry prompt
+//! * `tp-gui` — full vault manager window
+//! * `tp-gui pin` — PIN-matrix dialog (used by tp-host); prints the selected
+//!   positions to stdout
+//! * `tp-gui passphrase` — passphrase dialog (empty line = on-device)
+//! * `tp-gui connect` — "connect your Trezor" retry prompt
 
 #![forbid(unsafe_code)]
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -22,8 +22,8 @@ fn main() -> eframe::Result {
         _ => {
             let options = eframe::NativeOptions {
                 viewport: eframe::egui::ViewportBuilder::default()
-                    .with_inner_size([880.0, 560.0])
-                    .with_min_inner_size([640.0, 420.0]),
+                    .with_inner_size([900.0, 600.0])
+                    .with_min_inner_size([760.0, 480.0]),
                 centered: true,
                 ..Default::default()
             };

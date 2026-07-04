@@ -3,7 +3,7 @@
 //! renders [`Event`]s; device PIN/passphrase requests come back as events
 //! and the answers return through the reply channel.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use tp_core::crypto::SecretKey;
@@ -173,7 +173,7 @@ pub fn spawn(ctx: eframe::egui::Context) -> WorkerHandle {
 }
 
 fn do_unlock(
-    vault_path: &PathBuf,
+    vault_path: &Path,
     event_tx: &Sender<Event>,
     reply_rx: &Receiver<Reply>,
     ctx: &eframe::egui::Context,

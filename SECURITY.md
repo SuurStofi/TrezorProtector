@@ -138,6 +138,22 @@ the first 5 hex characters of the SHA-1 leave the machine (with
 `Add-Padding: true` to blur even prefix traffic analysis); suffix matching
 happens locally.
 
+## Added in the 2.1 hardening pass
+
+- **Seed-phrase recovery** ([`recovery.rs`](trezor_protector/rust/tp-core/src/recovery.rs)):
+  a second, device-independent wrapping of the master key under a 24-word
+  phrase (≈192 bits) + Argon2id, with an optional memorized passphrase. Lets
+  you re-bind the vault to a *new* Trezor if the old one is lost, without
+  weakening the normal device-only unlock.
+- **Swap/hibernation protection** ([`memlock.rs`](trezor_protector/rust/tp-core/src/memlock.rs)):
+  key pages are locked into RAM (`VirtualLock`/`mlock`) so secrets never
+  reach the page file. Kept `#![forbid(unsafe_code)]` via the `region` crate.
+- **Settings** ([`settings.rs`](trezor_protector/rust/tp-core/src/settings.rs)):
+  per-operation PIN, lock-on-disconnect, re-lock after manual lock, anti-RAT
+  screen-capture exclusion, auto-lock and clipboard-clear timers.
+- Full attack-surface table with honest residual-risk notes:
+  [ATTACKS.md](ATTACKS.md).
+
 ## Reporting
 
 Found something? Please open a private report rather than a public issue.

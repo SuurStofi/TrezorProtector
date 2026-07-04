@@ -1,11 +1,11 @@
-//! TrezorProtector CLI (`tp`) — hardware-backed password manager and file
+﻿//! TrezorProtector CLI (`tp`) вЂ” hardware-backed password manager and file
 //! encryption.
 
 #![forbid(unsafe_code)]
 
 mod interact;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -24,7 +24,7 @@ use interact::TermInteraction;
 #[command(
     name = "tp",
     version,
-    about = "TrezorProtector — password manager & file encryption backed by your Trezor"
+    about = "TrezorProtector вЂ” password manager & file encryption backed by your Trezor"
 )]
 struct Cli {
     /// Vault file path (env: TREZOR_PROTECTOR_VAULT)
@@ -73,6 +73,12 @@ enum Command {
     /// Vault maintenance: backup, restore, key rotation
     #[command(subcommand)]
     Vault(VaultCommand),
+    /// Show or change settings (~/.trezorprotector/settings.json)
+    Settings {
+        /// Set a value, e.g. `tp settings auto_lock_minutes 15`
+        key: Option<String>,
+        value: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -166,7 +172,7 @@ enum PwCommand {
         no_digits: bool,
         #[arg(long)]
         no_symbols: bool,
-        /// Skip look-alike characters (0/O, 1/l/I …)
+        /// Skip look-alike characters (0/O, 1/l/I вЂ¦)
         #[arg(long)]
         avoid_ambiguous: bool,
         #[arg(short, long, default_value_t = 5)]
@@ -197,7 +203,7 @@ enum FileCommand {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Decrypt a text file and print it — nothing touches the disk
+    /// Decrypt a text file and print it вЂ” nothing touches the disk
     View { input: PathBuf },
     /// Securely overwrite and delete a plaintext file
     Shred {
@@ -212,12 +218,31 @@ enum FileCommand {
 #[derive(Subcommand)]
 enum VaultCommand {
     /// Export all entries into a password-protected backup
-    /// (Argon2id + AES-256-GCM — recoverable WITHOUT the Trezor)
+    /// (Argon2id + AES-256-GCM вЂ” recoverable WITHOUT the Trezor)
     Export { output: PathBuf },
     /// Import entries from a backup file (merge by id, newest wins)
     Import { input: PathBuf },
     /// Re-wrap the vault under a fresh master key
     RotateKey,
+    /// Set up a recovery phrase so a NEW Trezor can be bound if the current
+    /// device is lost. Prints a phrase to write down offline.
+    RecoverySetup {
+        /// Number of words in the phrase (12вЂ“48; default 24 в‰€ 192 bits)
+        #[arg(long, default_value_t = 24)]
+        words: usize,
+        /// Also require an extra memorized passphrase (never written down)
+        #[arg(long)]
+        passphrase: bool,
+    },
+    /// Remove the recovery phrase wrapping from the vault
+    RecoveryRemove,
+    /// Recover access with the recovery phrase and bind the vault to the
+    /// Trezor that is currently connected (use after losing the old device)
+    Recover {
+        /// Prompt for the extra passphrase too
+        #[arg(long)]
+        passphrase: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -246,14 +271,58 @@ fn run(cli: Cli) -> Result<()> {
         Command::Audit { days, hibp } => cmd_audit(&vault_path, days, hibp),
         Command::File(cmd) => cmd_file(&vault_path, cmd),
         Command::Vault(cmd) => cmd_vault(&vault_path, cmd),
+        Command::Settings { key, value } => cmd_settings(key, value),
     }
+}
+
+fn cmd_settings(key: Option<String>, value: Option<String>) -> Result<()> {
+    use tp_core::settings::Settings;
+    let mut s = Settings::load_default();
+
+    if let (Some(key), Some(value)) = (key.as_ref(), value.as_ref()) {
+        let as_bool = || -> Result<bool> {
+            match value.to_lowercase().as_str() {
+                "true" | "on" | "yes" | "1" => Ok(true),
+                "false" | "off" | "no" | "0" => Ok(false),
+                _ => Err(Error::InvalidInput("expected true/false".into())),
+            }
+        };
+        let as_u64 = || value.parse::<u64>().map_err(|_| Error::InvalidInput("expected a number".into()));
+        match key.as_str() {
+            "pin_every_operation" => s.pin_every_operation = as_bool()?,
+            "auto_lock_minutes" => s.auto_lock_minutes = as_u64()?,
+            "lock_on_disconnect" => s.lock_on_disconnect = as_bool()?,
+            "relock_after_manual_lock" => s.relock_after_manual_lock = as_bool()?,
+            "screen_capture_protection" => s.screen_capture_protection = as_bool()?,
+            "clipboard_clear_seconds" => s.clipboard_clear_seconds = as_u64()?,
+            "show_site_icons" => s.show_site_icons = as_bool()?,
+            other => return Err(Error::InvalidInput(format!("unknown setting '{other}'"))),
+        }
+        s.save_default()?;
+        println!("{} {key} = {value}", "Set".green().bold());
+        return Ok(());
+    }
+    if key.is_some() != value.is_some() {
+        return Err(Error::InvalidInput("provide both a key and a value to set one".into()));
+    }
+
+    // No args: print all settings.
+    println!("{}", "Settings".bold().underline());
+    let json = serde_json::to_value(&s)?;
+    if let Some(map) = json.as_object() {
+        for (k, v) in map {
+            println!("  {:<28} {}", k.cyan(), v);
+        }
+    }
+    println!("\n{}", format!("File: {}", Settings::default_path().display()).dimmed());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // init / status / migrate
 // ---------------------------------------------------------------------------
 
-fn cmd_init(path: &PathBuf) -> Result<()> {
+fn cmd_init(path: &Path) -> Result<()> {
     if Vault::exists(path)
         && !interact::confirm(&format!(
             "A vault already exists at {}. Overwrite it (the old file is kept as .bak)?",
@@ -266,7 +335,7 @@ fn cmd_init(path: &PathBuf) -> Result<()> {
 
     let mut trezor = interact::connect()?;
     let master = SecretKey::generate();
-    println!("Wrapping master key — confirm on your Trezor…");
+    println!("Wrapping master key вЂ” confirm on your TrezorвЂ¦");
     let wrapped = trezor.encrypt_master_key(&master, &mut TermInteraction)?;
     Vault::create(path, &wrapped, &master)?;
 
@@ -284,7 +353,7 @@ fn cmd_init(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_status(path: &PathBuf) -> Result<()> {
+fn cmd_status(path: &Path) -> Result<()> {
     println!("Vault path : {}", path.display());
     if Vault::exists(path) {
         match Vault::load(path) {
@@ -292,7 +361,7 @@ fn cmd_status(path: &PathBuf) -> Result<()> {
             Err(e) => println!("Vault      : {e}"),
         }
     } else {
-        println!("Vault      : not found — run `tp init`");
+        println!("Vault      : not found вЂ” run `tp init`");
     }
 
     match tp_core::trezor::TrezorManager::connect() {
@@ -307,13 +376,13 @@ fn cmd_status(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_migrate(vault_path: &PathBuf, from: Option<PathBuf>) -> Result<()> {
-    let src = from.unwrap_or_else(|| vault_path.clone());
-    println!("Migrating v1 vault {} → v2…", src.display());
+fn cmd_migrate(vault_path: &Path, from: Option<PathBuf>) -> Result<()> {
+    let src = from.unwrap_or_else(|| vault_path.to_path_buf());
+    println!("Migrating v1 vault {} в†’ v2вЂ¦", src.display());
 
     let wrapped = vault::read_v1_wrapped_key(&src)?;
     let mut trezor = interact::connect()?;
-    println!("Unlocking with your Trezor — confirm on the device…");
+    println!("Unlocking with your Trezor вЂ” confirm on the deviceвЂ¦");
     let master = trezor.decrypt_master_key(&wrapped, &mut TermInteraction)?;
 
     let entries = vault::read_v1_entries(&src, &master)?;
@@ -326,7 +395,7 @@ fn cmd_migrate(vault_path: &PathBuf, from: Option<PathBuf>) -> Result<()> {
 
     vault::create_from_entries(vault_path, &wrapped, &master, entries)?;
     println!("Done. v2 vault written to {}", vault_path.display());
-    println!("v2 encrypts ALL metadata (names, usernames, URLs) — not just passwords.");
+    println!("v2 encrypts ALL metadata (names, usernames, URLs) вЂ” not just passwords.");
     Ok(())
 }
 
@@ -356,22 +425,23 @@ fn parse_tags(tags: &str) -> Vec<String> {
         .collect()
 }
 
-fn cmd_pw(vault_path: &PathBuf, cmd: PwCommand) -> Result<()> {
-    match cmd {
-        PwCommand::Generate {
-            length,
-            no_upper,
-            no_digits,
-            no_symbols,
-            avoid_ambiguous,
-            count,
-            passphrase,
-            words,
-        } => {
-            // No vault or device needed.
+fn cmd_pw(vault_path: &Path, cmd: PwCommand) -> Result<()> {
+    // Generation needs neither a vault nor the device.
+    if let PwCommand::Generate {
+        length,
+        no_upper,
+        no_digits,
+        no_symbols,
+        avoid_ambiguous,
+        count,
+        passphrase,
+        words,
+    } = cmd
+    {
+        {
             for i in 1..=count.clamp(1, 100) {
                 let (value, bits): (Zeroizing<String>, f64) = if passphrase {
-                    // 256-word list → exactly 8 bits of entropy per word.
+                    // 256-word list в†’ exactly 8 bits of entropy per word.
                     (passwords::generate_passphrase(words, "-")?, words as f64 * 8.0)
                 } else {
                     let pw = passwords::generate(&GenerateOptions {
@@ -391,9 +461,8 @@ fn cmd_pw(vault_path: &PathBuf, cmd: PwCommand) -> Result<()> {
                     colored_strength(bits)
                 );
             }
-            return Ok(());
         }
-        _ => {}
+        return Ok(());
     }
 
     let (_master, mut unlocked) = interact::unlock(vault_path)?;
@@ -426,7 +495,7 @@ fn cmd_pw(vault_path: &PathBuf, cmd: PwCommand) -> Result<()> {
                 "{} '{}' {}",
                 "Saved".green().bold(),
                 name.cyan(),
-                format!("(id {}…)", &id[..8]).dimmed()
+                format!("(id {}вЂ¦)", &id[..8]).dimmed()
             );
         }
 
@@ -472,7 +541,7 @@ fn cmd_pw(vault_path: &PathBuf, cmd: PwCommand) -> Result<()> {
                 println!(
                     "{} {}  {}",
                     label("Password"),
-                    "•".repeat(entry.password.chars().count().min(20)).dimmed(),
+                    "вЂў".repeat(entry.password.chars().count().min(20)).dimmed(),
                     "(use --show to reveal)".dimmed()
                 );
             }
@@ -579,12 +648,12 @@ fn cmd_pw(vault_path: &PathBuf, cmd: PwCommand) -> Result<()> {
 // totp
 // ---------------------------------------------------------------------------
 
-fn cmd_totp(vault_path: &PathBuf, query: &str, copy: bool) -> Result<()> {
+fn cmd_totp(vault_path: &Path, query: &str, copy: bool) -> Result<()> {
     let (_master, unlocked) = interact::unlock(vault_path)?;
     let entry = interact::pick_entry(&unlocked, query)?;
     let secret = entry.totp_secret.as_deref().ok_or_else(|| {
         Error::NotFound(format!(
-            "'{}' has no TOTP secret — add one with `tp pw update {} --totp <secret>`",
+            "'{}' has no TOTP secret вЂ” add one with `tp pw update {} --totp <secret>`",
             entry.name, entry.name
         ))
     })?;
@@ -604,7 +673,7 @@ fn cmd_totp(vault_path: &PathBuf, query: &str, copy: bool) -> Result<()> {
 // audit
 // ---------------------------------------------------------------------------
 
-fn cmd_audit(vault_path: &PathBuf, days: i64, hibp: bool) -> Result<()> {
+fn cmd_audit(vault_path: &Path, days: i64, hibp: bool) -> Result<()> {
     let (_master, unlocked) = interact::unlock(vault_path)?;
     let entries = unlocked.entries();
 
@@ -626,7 +695,7 @@ fn cmd_audit(vault_path: &PathBuf, days: i64, hibp: bool) -> Result<()> {
 
     if hibp {
         println!();
-        println!("Checking Have-I-Been-Pwned (k-anonymity: only 5 hash chars are sent)…");
+        println!("Checking Have-I-Been-Pwned (k-anonymity: only 5 hash chars are sent)вЂ¦");
         for e in entries {
             let (prefix, suffix) = audit::hibp_parts(&e.password);
             match hibp_range(&prefix) {
@@ -638,7 +707,7 @@ fn cmd_audit(vault_path: &PathBuf, days: i64, hibp: bool) -> Result<()> {
                     if let Some(count) = hit {
                         issues += 1;
                         println!(
-                            "{} {:<28} seen {count} times in public breaches — change it!",
+                            "{} {:<28} seen {count} times in public breaches вЂ” change it!",
                             "BREACHED".red().bold(),
                             truncate(&e.name, 26)
                         );
@@ -686,7 +755,7 @@ fn hibp_range(prefix: &str) -> Result<String> {
 // file
 // ---------------------------------------------------------------------------
 
-fn cmd_file(vault_path: &PathBuf, cmd: FileCommand) -> Result<()> {
+fn cmd_file(vault_path: &Path, cmd: FileCommand) -> Result<()> {
     // Shred never needs the vault or the device.
     if let FileCommand::Shred { input, passes, yes } = &cmd {
         if !yes && !interact::confirm(&format!(
@@ -743,11 +812,11 @@ fn cmd_file(vault_path: &PathBuf, cmd: FileCommand) -> Result<()> {
 // vault
 // ---------------------------------------------------------------------------
 
-fn cmd_vault(vault_path: &PathBuf, cmd: VaultCommand) -> Result<()> {
+fn cmd_vault(vault_path: &Path, cmd: VaultCommand) -> Result<()> {
     match cmd {
         VaultCommand::Export { output } => {
             let (_master, unlocked) = interact::unlock(vault_path)?;
-            println!("This backup can be opened WITHOUT the Trezor — protect it with a");
+            println!("This backup can be opened WITHOUT the Trezor вЂ” protect it with a");
             println!("strong password you will remember (a diceware passphrase is ideal).");
             let password = interact::prompt_new_password("Backup password (min 8 chars)")?;
             unlocked.export_backup(&output, &password)?;
@@ -764,15 +833,99 @@ fn cmd_vault(vault_path: &PathBuf, cmd: VaultCommand) -> Result<()> {
         }
         VaultCommand::RotateKey => {
             let (_old_master, mut unlocked) = interact::unlock(vault_path)?;
-            println!("Generating a fresh master key and re-wrapping on the device…");
+            println!("Generating a fresh master key and re-wrapping on the deviceвЂ¦");
             let mut trezor = interact::connect()?;
             let new_master = SecretKey::generate();
             let new_wrapped = trezor.encrypt_master_key(&new_master, &mut TermInteraction)?;
             unlocked.rotate_key(&new_master, &new_wrapped)?;
             println!("Master key rotated. Old encrypted backups of the VAULT FILE are now");
-            println!("undecryptable with the new key — but `tp vault export` backups still work.");
+            println!("undecryptable with the new key вЂ” but `tp vault export` backups still work.");
             println!("Note: files encrypted with `tp file encrypt` used the OLD key; decrypt");
             println!("them before rotating, or keep the old vault .bak file safe.");
+        }
+        VaultCommand::RecoverySetup { words, passphrase } => {
+            let (master, mut unlocked) = interact::unlock(vault_path)?;
+            let phrase = tp_core::recovery::generate_phrase(words)?;
+            let pass = if passphrase {
+                println!("Choose an extra passphrase вЂ” memorize it, do NOT write it with the phrase.");
+                interact::prompt_new_password("Recovery passphrase")?
+            } else {
+                String::new()
+            };
+            unlocked.set_recovery(&master, &phrase, &pass, words)?;
+
+            println!();
+            println!("{}", "в•ђв•ђв•ђ RECOVERY PHRASE вЂ” write this down offline в•ђв•ђв•ђ".yellow().bold());
+            println!();
+            // Print numbered words so nothing is mistranscribed.
+            for (i, w) in phrase.split_whitespace().enumerate() {
+                print!("{:>2}.{:<12}", i + 1, w);
+                if (i + 1) % 4 == 0 {
+                    println!();
+                }
+            }
+            println!();
+            println!();
+            println!("{}", "Anyone with this phrase can decrypt your vault. Store it on paper,".red());
+            println!("{}", "never photograph it or type it anywhere but `tp vault recover`.".red());
+            if passphrase {
+                println!("You will ALSO need the passphrase you just chose вЂ” without it the");
+                println!("written phrase alone recovers nothing.");
+            }
+        }
+        VaultCommand::RecoveryRemove => {
+            let (_master, mut unlocked) = interact::unlock(vault_path)?;
+            if !unlocked.has_recovery() {
+                println!("No recovery phrase is set.");
+                return Ok(());
+            }
+            if interact::confirm("Remove the recovery phrase? You will not be able to re-bind a new device without it.") {
+                unlocked.remove_recovery()?;
+                println!("{}", "Recovery phrase removed.".green());
+            } else {
+                println!("Cancelled.");
+            }
+        }
+        VaultCommand::Recover { passphrase } => {
+            // The OLD device is assumed gone вЂ” no device unlock here.
+            let mut vault = Vault::load(vault_path)?;
+            if !vault.has_recovery() {
+                return Err(Error::InvalidInput(
+                    "this vault has no recovery phrase set up (run `tp vault recovery-setup` while you still have the device)".into(),
+                ));
+            }
+            println!("Enter your recovery phrase (words separated by spaces):");
+            let phrase = Zeroizing::new(
+                rpassword::prompt_password("Phrase: ")
+                    .map_err(|e| Error::InvalidInput(format!("cannot read phrase: {e}")))?,
+            );
+            let pass = if passphrase {
+                Zeroizing::new(
+                    rpassword::prompt_password("Recovery passphrase: ")
+                        .map_err(|e| Error::InvalidInput(format!("cannot read passphrase: {e}")))?,
+                )
+            } else {
+                Zeroizing::new(String::new())
+            };
+
+            println!("Verifying phraseвЂ¦");
+            let master = vault.recover_master_key(&phrase, &pass)?;
+            println!("{}", "Phrase accepted.".green().bold());
+
+            println!("Now connect the NEW Trezor to bind this vault to it.");
+            let mut trezor = interact::connect()?;
+            println!("Re-wrapping the master key вЂ” confirm on the new deviceвЂ¦");
+            let new_wrapped = trezor.encrypt_master_key(&master, &mut TermInteraction)?;
+            vault.rebind(&new_wrapped)?;
+
+            // Sanity check: the new device can now unlock.
+            let check = vault.unlock(&master)?;
+            println!(
+                "{} the vault is now bound to this device ({} entries).",
+                "Recovered:".green().bold(),
+                check.entries().len()
+            );
+            println!("Set a new PIN on the device in Trezor Suite if you have not already.");
         }
     }
     Ok(())
@@ -796,6 +949,6 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{cut}…")
+        format!("{cut}вЂ¦")
     }
 }

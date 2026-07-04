@@ -12,7 +12,7 @@ use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::Sha256;
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 
@@ -20,31 +20,45 @@ pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
 
-/// A 32-byte secret key that is wiped from memory on drop.
-#[derive(Zeroize, ZeroizeOnDrop)]
-pub struct SecretKey([u8; KEY_LEN]);
+/// A 32-byte secret key that is wiped from memory on drop and whose backing
+/// page is locked into RAM (`VirtualLock` / `mlock`) so it is never written
+/// to the swap file / hibernation image. See [`crate::memlock`].
+///
+/// The key lives behind a `Box` so its address is stable — a prerequisite
+/// for locking the exact page it occupies.
+pub struct SecretKey {
+    bytes: Box<[u8; KEY_LEN]>,
+    _lock: crate::memlock::Locked,
+}
 
 impl SecretKey {
     pub fn new(bytes: [u8; KEY_LEN]) -> Self {
-        Self(bytes)
+        let mut boxed = Box::new(bytes);
+        // Zero the caller's stack copy; the canonical copy is now on the heap.
+        let mut scratch = bytes;
+        scratch.zeroize();
+        let lock = crate::memlock::lock(boxed.as_mut_ptr(), KEY_LEN);
+        Self { bytes: boxed, _lock: lock }
     }
 
     pub fn from_slice(bytes: &[u8]) -> Result<Self> {
         let arr: [u8; KEY_LEN] = bytes
             .try_into()
             .map_err(|_| Error::Crypto("key must be exactly 32 bytes".into()))?;
-        Ok(Self(arr))
+        Ok(Self::new(arr))
     }
 
     /// Generate a fresh random key from the OS CSPRNG.
     pub fn generate() -> Self {
         let mut bytes = [0u8; KEY_LEN];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
-        Self(bytes)
+        let key = Self::new(bytes);
+        bytes.zeroize();
+        key
     }
 
     pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
-        &self.0
+        &self.bytes
     }
 
     /// Derive a domain-separated subkey (HKDF-SHA256).
@@ -54,13 +68,43 @@ impl SecretKey {
     /// derived key, so a compromise or misuse of one context cannot be
     /// leveraged against another.
     pub fn derive(&self, context: &str) -> SecretKey {
-        let hk = Hkdf::<Sha256>::new(Some(b"TrezorProtector.v2"), &self.0);
+        let hk = Hkdf::<Sha256>::new(Some(b"TrezorProtector.v2"), self.bytes.as_ref());
         let mut okm = [0u8; KEY_LEN];
         hk.expand(context.as_bytes(), &mut okm)
             .expect("32 bytes is a valid HKDF-SHA256 output length");
-        SecretKey(okm)
+        let key = SecretKey::new(okm);
+        okm.zeroize();
+        key
     }
 }
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        // Wipe before the page lock is released (self._lock drops after).
+        self.bytes.zeroize();
+    }
+}
+
+/// Argon2id key derivation (shared by the recovery phrase and the
+/// password-protected backup). 64 MiB, 3 passes — deliberately expensive so
+/// even a low-entropy passphrase is costly to attack offline.
+pub fn argon2id_key(secret: &[u8], salt: &[u8]) -> Result<SecretKey> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    let params = Params::new(ARGON_M_KIB, ARGON_T, ARGON_P, Some(KEY_LEN))
+        .map_err(|e| Error::Crypto(format!("argon2 params: {e}")))?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut okm = [0u8; KEY_LEN];
+    argon
+        .hash_password_into(secret, salt, &mut okm)
+        .map_err(|e| Error::Crypto(format!("argon2: {e}")))?;
+    let key = SecretKey::new(okm);
+    okm.zeroize();
+    Ok(key)
+}
+
+pub const ARGON_M_KIB: u32 = 65536; // 64 MiB
+pub const ARGON_T: u32 = 3;
+pub const ARGON_P: u32 = 1;
 
 /// Encrypt `plaintext` bound to `aad`. Returns nonce || ciphertext || tag.
 pub fn encrypt(key: &SecretKey, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {

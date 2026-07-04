@@ -121,8 +121,9 @@ pub fn strength_label(bits: f64) -> &'static str {
     }
 }
 
-/// 256 common, distinct English words (8 bits each).
-fn wordlist() -> &'static [&'static str] {
+/// 256 common, distinct English words (8 bits each). Shared with the
+/// recovery-phrase generator.
+pub(crate) fn wordlist() -> &'static [&'static str] {
     &[
         "acorn", "alarm", "amber", "anchor", "apple", "april", "arrow", "atlas",
         "autumn", "badge", "bagel", "bamboo", "banana", "banner", "basil", "beach",

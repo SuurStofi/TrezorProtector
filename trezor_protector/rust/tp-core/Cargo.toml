@@ -19,5 +19,6 @@ hkdf.workspace = true
 base32.workspace = true
 rand.workspace = true
 argon2.workspace = true
+region.workspace = true
 time.workspace = true
 trezor-client.workspace = true

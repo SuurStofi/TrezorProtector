@@ -116,6 +116,10 @@ struct Header {
     key_protection: String,
     encrypted_master_key: String,
     data: String,
+    /// Optional second wrapping of the master key under a recovery phrase,
+    /// enabling re-binding to a new Trezor. See [`crate::recovery`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery: Option<crate::recovery::RecoveryData>,
 }
 
 pub fn default_path() -> PathBuf {
@@ -146,6 +150,7 @@ impl Vault {
             key_protection: KEY_PROTECTION.into(),
             encrypted_master_key: hex::encode(wrapped_master_key),
             data: String::new(),
+            recovery: None,
         };
         header.data = seal_entries(&[], master)?;
         let vault = Vault { path: path.to_path_buf(), header };
@@ -190,6 +195,32 @@ impl Vault {
     pub fn wrapped_master_key(&self) -> Result<Vec<u8>> {
         hex::decode(&self.header.encrypted_master_key)
             .map_err(|_| Error::Vault("corrupt encrypted_master_key field".into()))
+    }
+
+    /// Whether a recovery phrase has been set up for this vault.
+    pub fn has_recovery(&self) -> bool {
+        self.header.recovery.is_some()
+    }
+
+    /// Recover the master key from the recovery phrase (used when the Trezor
+    /// is lost). The caller then re-binds it to a new device via
+    /// [`Vault::rebind`].
+    pub fn recover_master_key(&self, phrase: &str, passphrase: &str) -> Result<SecretKey> {
+        let data = self
+            .header
+            .recovery
+            .as_ref()
+            .ok_or_else(|| Error::Vault("no recovery phrase set up for this vault".into()))?;
+        crate::recovery::unwrap(phrase, passphrase, data)
+    }
+
+    /// Overwrite the device wrapping with `new_wrapped` (the master key
+    /// re-encrypted by a new Trezor) and persist. The vault data itself is
+    /// untouched — the master key is unchanged, only its device wrapping.
+    pub fn rebind(&mut self, new_wrapped: &[u8]) -> Result<()> {
+        self.header.encrypted_master_key = hex::encode(new_wrapped);
+        self.header.updated_at = now_rfc3339();
+        self.write_to_disk()
     }
 
     /// Decrypt the entry list with the master key returned by the Trezor.
@@ -318,6 +349,32 @@ impl UnlockedVault {
             return Err(Error::NotFound(format!("entry {id}")));
         }
         self.save()
+    }
+
+    /// Set up (or replace) the recovery phrase. `master` is the unwrapped
+    /// master key obtained at unlock time; it is wrapped a second time under
+    /// the phrase so a new Trezor can later be bound to this vault.
+    pub fn set_recovery(
+        &mut self,
+        master: &SecretKey,
+        phrase: &str,
+        passphrase: &str,
+        words: usize,
+    ) -> Result<()> {
+        let data = crate::recovery::wrap(phrase, passphrase, words, master)?;
+        self.vault.header.recovery = Some(data);
+        self.vault.header.updated_at = now_rfc3339();
+        self.vault.write_to_disk()
+    }
+
+    pub fn remove_recovery(&mut self) -> Result<()> {
+        self.vault.header.recovery = None;
+        self.vault.header.updated_at = now_rfc3339();
+        self.vault.write_to_disk()
+    }
+
+    pub fn has_recovery(&self) -> bool {
+        self.vault.has_recovery()
     }
 
     /// Re-encrypt the entry list and write the vault atomically.
@@ -509,6 +566,7 @@ pub fn create_from_entries(
         key_protection: KEY_PROTECTION.into(),
         encrypted_master_key: hex::encode(wrapped_master_key),
         data: seal_entries(&entries, master)?,
+        recovery: None,
     };
     atomic_write_json(path, &header)
 }
@@ -517,21 +575,14 @@ pub fn create_from_entries(
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ARGON_M_KIB: u32 = 65536; // 64 MiB
-const ARGON_T: u32 = 3;
-const ARGON_P: u32 = 1;
-
 fn argon2_key(password: &str, salt: &[u8]) -> Result<SecretKey> {
-    use argon2::{Algorithm, Argon2, Params, Version};
-    let params = Params::new(ARGON_M_KIB, ARGON_T, ARGON_P, Some(32))
-        .map_err(|e| Error::Crypto(format!("argon2 params: {e}")))?;
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut okm = [0u8; 32];
-    argon
-        .hash_password_into(password.as_bytes(), salt, &mut okm)
-        .map_err(|e| Error::Crypto(format!("argon2: {e}")))?;
-    Ok(SecretKey::new(okm))
+    crypto::argon2id_key(password.as_bytes(), salt)
 }
+
+// Re-exported for the backup header so the on-disk KDF metadata stays in sync.
+const ARGON_M_KIB: u32 = crypto::ARGON_M_KIB;
+const ARGON_T: u32 = crypto::ARGON_T;
+const ARGON_P: u32 = crypto::ARGON_P;
 
 fn seal_entries(entries: &[Entry], master: &SecretKey) -> Result<String> {
     seal_with_key(entries, &master.derive(VAULT_KEY_CONTEXT))
