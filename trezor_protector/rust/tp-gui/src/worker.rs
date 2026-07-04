@@ -14,6 +14,8 @@ use tp_core::{files, Error, Result};
 pub enum Cmd {
     Unlock,
     Lock,
+    /// Re-read the vault from disk (another process may have written it).
+    Reload,
     Add {
         name: String,
         username: String,
@@ -35,6 +37,11 @@ pub enum Cmd {
         id: String,
     },
     EncryptFile(PathBuf),
+    /// Encrypt to a chosen destination (used for custom-extension masquerade).
+    EncryptFileAs {
+        src: PathBuf,
+        dst: PathBuf,
+    },
     DecryptFile(PathBuf),
 }
 
@@ -47,6 +54,8 @@ pub enum Event {
     Locked,
     Error(String),
     Info(String),
+    /// The Trezor was unplugged (emitted by the presence watcher).
+    DeviceGone,
 }
 
 pub enum Reply {
@@ -62,9 +71,40 @@ pub struct WorkerHandle {
 }
 
 pub fn spawn(ctx: eframe::egui::Context) -> WorkerHandle {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
     let (cmd_tx, cmd_rx) = channel::<Cmd>();
     let (reply_tx, reply_rx) = channel::<Reply>();
     let (event_tx, event_rx) = channel::<Event>();
+
+    // Shared flags for the device-presence watcher: don't poll USB while a
+    // device operation is in flight, and only report removals when unlocked.
+    let busy = Arc::new(AtomicBool::new(false));
+    let unlocked_flag = Arc::new(AtomicBool::new(false));
+
+    // --- Device-presence watcher (enforces lock-on-disconnect) -----------
+    {
+        let event_tx = event_tx.clone();
+        let ctx = ctx.clone();
+        let busy = busy.clone();
+        let unlocked_flag = unlocked_flag.clone();
+        std::thread::spawn(move || {
+            let mut was_present = true;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                if busy.load(Ordering::Relaxed) {
+                    continue; // a device op holds the USB handle right now
+                }
+                let present = tp_core::trezor::device_present();
+                if was_present && !present && unlocked_flag.load(Ordering::Relaxed) {
+                    let _ = event_tx.send(Event::DeviceGone);
+                    ctx.request_repaint();
+                }
+                was_present = present;
+            }
+        });
+    }
 
     std::thread::spawn(move || {
         let mut session: Option<(SecretKey, vault::UnlockedVault)> = None;
@@ -83,17 +123,30 @@ pub fn spawn(ctx: eframe::egui::Context) -> WorkerHandle {
                     if session.is_some() {
                         continue;
                     }
-                    match do_unlock(&vault_path, &event_tx, &reply_rx, &ctx) {
+                    busy.store(true, Ordering::Relaxed);
+                    let result = do_unlock(&vault_path, &event_tx, &reply_rx, &ctx);
+                    busy.store(false, Ordering::Relaxed);
+                    match result {
                         Ok((master, unlocked)) => {
                             emit(Event::Unlocked(unlocked.entries().to_vec()));
                             session = Some((master, unlocked));
+                            unlocked_flag.store(true, Ordering::Relaxed);
                         }
                         Err(e) => emit(Event::Error(e.to_string())),
                     }
                 }
                 Cmd::Lock => {
                     session = None; // zeroizes keys + entries on drop
+                    unlocked_flag.store(false, Ordering::Relaxed);
                     emit(Event::Locked);
+                }
+                Cmd::Reload => {
+                    if let Some((_, unlocked)) = session.as_mut() {
+                        match unlocked.reload() {
+                            Ok(()) => emit(Event::Entries(unlocked.entries().to_vec())),
+                            Err(e) => emit(Event::Error(e.to_string())),
+                        }
+                    }
                 }
                 Cmd::Add { name, username, url, password, notes, totp } => {
                     let Some((_, unlocked)) = session.as_mut() else {
@@ -150,6 +203,19 @@ pub fn spawn(ctx: eframe::egui::Context) -> WorkerHandle {
                     };
                     match files::encrypt_file(master, &path, None) {
                         Ok(out) => emit(Event::Info(format!("Encrypted → {}", out.display()))),
+                        Err(e) => emit(Event::Error(e.to_string())),
+                    }
+                }
+                Cmd::EncryptFileAs { src, dst } => {
+                    let Some((master, _)) = session.as_ref() else {
+                        emit(Event::Error("vault is locked".into()));
+                        continue;
+                    };
+                    match files::encrypt_file(master, &src, Some(&dst)) {
+                        Ok(out) => emit(Event::Info(format!(
+                            "Encrypted → {} (opens only in TrezorProtector)",
+                            out.display()
+                        ))),
                         Err(e) => emit(Event::Error(e.to_string())),
                     }
                 }

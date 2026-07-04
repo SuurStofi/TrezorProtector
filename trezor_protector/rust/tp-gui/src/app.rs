@@ -53,6 +53,47 @@ fn trunc(s: &str, max: usize) -> String {
     }
 }
 
+/// Registrable-ish domain used to group entries into folders.
+fn domain_key(entry: &Entry) -> String {
+    let basis = if !entry.url.is_empty() { &entry.url } else { &entry.name };
+    let host = basis.rsplit("://").next().unwrap_or(basis);
+    let host = host.split('/').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    let host = host.trim_start_matches("www.").to_lowercase();
+    let labels: Vec<&str> = host.split('.').filter(|s| !s.is_empty()).collect();
+    if labels.len() >= 2 {
+        format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1])
+    } else if host.is_empty() {
+        entry.name.to_lowercase()
+    } else {
+        host
+    }
+}
+
+/// Render one selectable entry row (tile + label). Returns true if clicked.
+fn entry_row(
+    ui: &mut egui::Ui,
+    entry: &Entry,
+    label: &str,
+    selected: Option<&str>,
+    show_icons: bool,
+) -> bool {
+    let is_sel = selected == Some(entry.id.as_str());
+    ui.horizontal(|ui| {
+        if show_icons {
+            let (ch, color) = site_label(entry);
+            draw_tile(ui, ch, color);
+        }
+        let text = if entry.username.is_empty() || label == entry.username {
+            trunc(label, 30)
+        } else {
+            format!("{}\n    {}", trunc(label, 26), trunc(&entry.username, 28))
+        };
+        ui.add(egui::SelectableLabel::new(is_sel, text)).clicked()
+    })
+    .inner
+}
+
 fn draw_tile(ui: &mut egui::Ui, ch: char, color: Color32) {
     let size = egui::vec2(22.0, 22.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -114,6 +155,10 @@ pub struct ManagerApp {
     gen_output: String,
     last_activity: Instant,
     settings: Settings,
+    vault_path: std::path::PathBuf,
+    last_vault_mtime: Option<std::time::SystemTime>,
+    last_sync_check: Instant,
+    applied_capture_protection: Option<bool>,
 }
 
 impl ManagerApp {
@@ -135,6 +180,12 @@ impl ManagerApp {
             gen_output: String::new(),
             last_activity: Instant::now(),
             settings: Settings::load_default(),
+            vault_path: std::env::var_os("TREZOR_PROTECTOR_VAULT")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(tp_core::vault::default_path),
+            last_vault_mtime: None,
+            last_sync_check: Instant::now(),
+            applied_capture_protection: None,
         }
     }
 
@@ -154,10 +205,21 @@ impl ManagerApp {
                         ACCENT,
                     );
                     self.last_activity = Instant::now();
+                    self.last_vault_mtime = tp_core::vault::file_mtime(&self.vault_path);
                 }
                 Event::Entries(entries) => {
                     self.entries = entries;
                     self.form = None;
+                    // Our own write (or an accepted reload) updated the file;
+                    // re-baseline so the poll doesn't reload again pointlessly.
+                    self.last_vault_mtime = tp_core::vault::file_mtime(&self.vault_path);
+                }
+                Event::DeviceGone => {
+                    if self.settings.lock_on_disconnect && self.unlocked {
+                        let _ = self.worker.cmd_tx.send(Cmd::Lock);
+                        self.status =
+                            ("Trezor unplugged — vault locked".into(), Color32::from_rgb(224, 82, 82));
+                    }
                 }
                 Event::Locked => {
                     self.unlocked = false;
@@ -190,6 +252,19 @@ impl ManagerApp {
             }
         });
         self.status = (format!("{what} copied — clipboard clears in 30 s"), ACCENT);
+    }
+
+    /// Called after a stored secret is revealed or copied. When
+    /// "require confirmation for every operation" is on, this re-locks the
+    /// vault so the next secret access needs a fresh device unlock.
+    fn after_secret_access(&mut self) {
+        if self.settings.pin_every_operation {
+            let _ = self.worker.cmd_tx.send(Cmd::Lock);
+            self.status = (
+                "Locked (per-operation confirmation is on)".into(),
+                Color32::GRAY,
+            );
+        }
     }
 
     fn generate(&mut self) {
@@ -246,7 +321,7 @@ impl ManagerApp {
         ui.add_space(6.0);
 
         let query = self.search.to_lowercase();
-        let ids: Vec<Entry> = self
+        let matches: Vec<Entry> = self
             .entries
             .iter()
             .filter(|e| {
@@ -258,29 +333,52 @@ impl ManagerApp {
             .cloned()
             .collect();
 
+        // Group by registrable domain so a site with several accounts
+        // collapses into one folder.
+        let mut groups: std::collections::BTreeMap<String, Vec<Entry>> = Default::default();
+        for e in matches {
+            groups.entry(domain_key(&e)).or_default().push(e);
+        }
+        for v in groups.values_mut() {
+            v.sort_by_key(|e| e.username.to_lowercase());
+        }
+
         let show_icons = self.settings.show_site_icons;
+        let searching = !query.is_empty();
+        let mut clicked: Option<String> = None;
+
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for entry in ids {
-                let selected = self.selected.as_deref() == Some(entry.id.as_str());
-                let resp = ui.horizontal(|ui| {
-                    if show_icons {
-                        let (ch, color) = site_label(&entry);
-                        draw_tile(ui, ch, color);
+            for (domain, items) in &groups {
+                if items.len() == 1 {
+                    // Singleton: render the entry directly, no folder.
+                    let e = &items[0];
+                    if entry_row(ui, e, &e.name, self.selected.as_deref(), show_icons) {
+                        clicked = Some(e.id.clone());
                     }
-                    ui.add(
-                        egui::SelectableLabel::new(
-                            selected,
-                            format!("{}\n    {}", trunc(&entry.name, 26), trunc(&entry.username, 28)),
-                        ),
+                } else {
+                    // Multi-account site: a collapsible folder.
+                    let header = egui::CollapsingHeader::new(
+                        RichText::new(format!("🗂  {domain}  ({})", items.len())).strong(),
                     )
-                });
-                if resp.inner.clicked() {
-                    self.selected = Some(entry.id.clone());
-                    self.reveal = false;
-                    self.form = None;
+                    .id_salt(("domain", domain))
+                    .default_open(searching);
+                    header.show(ui, |ui| {
+                        for e in items {
+                            let label = if e.username.is_empty() { e.name.clone() } else { e.username.clone() };
+                            if entry_row(ui, e, &label, self.selected.as_deref(), show_icons) {
+                                clicked = Some(e.id.clone());
+                            }
+                        }
+                    });
                 }
             }
         });
+
+        if let Some(id) = clicked {
+            self.selected = Some(id);
+            self.reveal = false;
+            self.form = None;
+        }
     }
 
     fn details_panel(&mut self, ui: &mut egui::Ui) {
@@ -308,6 +406,7 @@ impl ManagerApp {
         }
         ui.add_space(10.0);
 
+        let mut secret_copied = false;
         egui::Grid::new("detail-grid").num_columns(3).spacing([10.0, 8.0]).show(ui, |ui| {
             ui.label(RichText::new("Username").strong());
             ui.label(&entry.username);
@@ -328,6 +427,7 @@ impl ManagerApp {
                 }
                 if ui.small_button("Copy").clicked() {
                     self.copy_autoclear(&entry.password, "Password");
+                    secret_copied = true;
                 }
             });
             ui.end_row();
@@ -347,6 +447,7 @@ impl ManagerApp {
                         );
                         if ui.small_button("Copy").clicked() {
                             self.copy_autoclear(&code.code, "2FA code");
+                            secret_copied = true;
                         }
                     }
                     Err(e) => {
@@ -404,6 +505,10 @@ impl ManagerApp {
                 };
             }
         });
+
+        if secret_copied {
+            self.after_secret_access();
+        }
     }
 
     fn form_view(&mut self, ui: &mut egui::Ui) {
@@ -516,17 +621,37 @@ impl ManagerApp {
 
     fn tools_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            if ui.button("🔒 Encrypt file…").clicked() {
-                if let Some(path) = rfd::FileDialog::new().pick_file() {
-                    let _ = self.worker.cmd_tx.send(Cmd::EncryptFile(path));
+            if ui
+                .button("🔒 Encrypt files…")
+                .on_hover_text("Import one or more files and encrypt each with your Trezor key")
+                .clicked()
+            {
+                if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                    for path in paths {
+                        let _ = self.worker.cmd_tx.send(Cmd::EncryptFile(path));
+                    }
                 }
             }
-            if ui.button("🔓 Decrypt file…").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("TrezorProtector", &["tpenc"])
-                    .pick_file()
-                {
-                    let _ = self.worker.cmd_tx.send(Cmd::DecryptFile(path));
+            if ui
+                .button("🎭 Encrypt as…")
+                .on_hover_text("Encrypt one file to a name/extension you choose (e.g. notes.pdf)")
+                .clicked()
+            {
+                if let Some(src) = rfd::FileDialog::new().pick_file() {
+                    let suggested = src
+                        .file_name()
+                        .map(|n| format!("{}.pdf", n.to_string_lossy()))
+                        .unwrap_or_else(|| "encrypted.pdf".into());
+                    if let Some(dst) = rfd::FileDialog::new().set_file_name(suggested).save_file() {
+                        let _ = self.worker.cmd_tx.send(Cmd::EncryptFileAs { src, dst });
+                    }
+                }
+            }
+            if ui.button("🔓 Decrypt files…").clicked() {
+                if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                    for path in paths {
+                        let _ = self.worker.cmd_tx.send(Cmd::DecryptFile(path));
+                    }
                 }
             }
             ui.separator();
@@ -702,9 +827,11 @@ impl ManagerApp {
                         );
                         if s.screen_capture_protection {
                             ui.label(
-                                RichText::new("Screen-capture protection applies on next launch.")
-                                    .weak()
-                                    .size(11.0),
+                                RichText::new(
+                                    "Windows are now hidden from screen capture / remote streaming.",
+                                )
+                                .weak()
+                                .size(11.0),
                             );
                         }
 
@@ -737,6 +864,14 @@ impl eframe::App for ManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
 
+        // Apply screen-capture protection when the setting changes (the
+        // window exists by now, so this takes effect immediately).
+        let want = self.settings.screen_capture_protection;
+        if self.applied_capture_protection != Some(want) {
+            crate::platform::apply_screen_capture_protection(want);
+            self.applied_capture_protection = Some(want);
+        }
+
         // Track activity for auto-lock; tick once per second for TOTP.
         if ctx.input(|i| !i.events.is_empty()) {
             self.last_activity = Instant::now();
@@ -746,6 +881,16 @@ impl eframe::App for ManagerApp {
             let minutes = self.settings.auto_lock_minutes;
             if minutes > 0 && self.last_activity.elapsed() > Duration::from_secs(minutes * 60) {
                 let _ = self.worker.cmd_tx.send(Cmd::Lock);
+            }
+            // Pick up writes made by the browser extension host (or any other
+            // process) roughly once a second.
+            if self.last_sync_check.elapsed() > Duration::from_millis(900) {
+                self.last_sync_check = Instant::now();
+                let current = tp_core::vault::file_mtime(&self.vault_path);
+                if current != self.last_vault_mtime {
+                    self.last_vault_mtime = current;
+                    let _ = self.worker.cmd_tx.send(Cmd::Reload);
+                }
             }
         }
 

@@ -242,6 +242,12 @@ impl Vault {
     }
 }
 
+/// Last-modified time of a vault file, for cheap cross-process change
+/// detection (the extension host and the desktop app share one file).
+pub fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 // ---------------------------------------------------------------------------
 // Unlocked vault
 // ---------------------------------------------------------------------------
@@ -279,6 +285,26 @@ impl EntryPatch {
 impl UnlockedVault {
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.vault.path
+    }
+
+    /// Re-read the vault file from disk and re-decrypt it with the key we
+    /// already hold — no device interaction needed. Used to pick up writes
+    /// made by another process (e.g. the browser extension saving a
+    /// password while the desktop app is open).
+    pub fn reload(&mut self) -> Result<()> {
+        let raw = fs::read_to_string(&self.vault.path)?;
+        let header: Header = serde_json::from_str(&raw)?;
+        let blob = hex::decode(&header.data)
+            .map_err(|_| Error::Vault("corrupt data field".into()))?;
+        let plaintext = crypto::decrypt(&self.vault_key, &blob, VAULT_AAD)
+            .map_err(|_| Error::Vault("cannot re-decrypt vault after external change".into()))?;
+        self.entries = serde_json::from_slice(&plaintext)?;
+        self.vault.header = header;
+        Ok(())
     }
 
     pub fn find(&self, query: &str) -> Vec<&Entry> {
@@ -668,6 +694,30 @@ mod tests {
         Vault::create(&path, &[0u8; 32], &master).unwrap();
         let other = SecretKey::generate();
         assert!(Vault::load(&path).unwrap().unlock(&other).is_err());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn reload_picks_up_external_writes() {
+        // Simulates the extension host writing while the app holds the vault.
+        let dir = tmpdir();
+        let path = dir.join("vault.json");
+        let master = SecretKey::generate();
+        Vault::create(&path, &[0u8; 32], &master).unwrap();
+
+        let mut app_view = Vault::load(&path).unwrap().unlock(&master).unwrap();
+        assert!(app_view.entries().is_empty());
+
+        // Another process opens, adds an entry, and writes.
+        let mut host_view = Vault::load(&path).unwrap().unlock(&master).unwrap();
+        host_view.add(Entry::new("bank", "me", "https://bank.com", "pw", "")).unwrap();
+        drop(host_view);
+
+        // Stale until reload; fresh after.
+        assert!(app_view.entries().is_empty());
+        app_view.reload().unwrap();
+        assert_eq!(app_view.entries().len(), 1);
+        assert_eq!(app_view.entries()[0].name, "bank");
         fs::remove_dir_all(dir).ok();
     }
 

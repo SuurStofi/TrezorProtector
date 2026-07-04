@@ -292,6 +292,121 @@ fn decrypt_v1(
 }
 
 // ---------------------------------------------------------------------------
+// Steganographic dropper (hidden payload appended to a carrier file)
+// ---------------------------------------------------------------------------
+//
+// A "container" is an ordinary file (PDF, JPEG, ZIP, PNG …) with an encrypted
+// payload appended after its normal content plus a small trailer. Because
+// those formats stop parsing at their own end marker and ignore trailing
+// bytes, double-clicking the container opens the carrier normally in its
+// default app. Only TrezorProtector — with the device — reveals the hidden
+// file.
+//
+// Layout:
+//   [ carrier bytes ][ hidden blob ][ u64 BE hidden_len ][ 8-byte magic ]
+// hidden blob = file_id(16) || AES-256-GCM( u16 name_len | name | secret )
+//
+// Honesty: this is *hiding*, not cryptographic deniability. Someone who
+// knows this tool can spot the trailer magic and tell a payload exists (they
+// still can't read it without the device). For strong deniability, don't
+// rely on obscurity.
+
+const STEG_MAGIC: &[u8; 8] = b"TPSTEG01";
+const AAD_STEG: &[u8] = b"TPENC2.steg";
+
+/// Append `secret` to `carrier`, producing `output` (a working carrier file
+/// that also carries the hidden, encrypted secret).
+pub fn embed_hidden(
+    master: &SecretKey,
+    carrier: &Path,
+    secret: &Path,
+    output: &Path,
+) -> Result<()> {
+    let carrier_bytes = fs::read(carrier)?;
+    let secret_bytes = Zeroizing::new(fs::read(secret)?);
+    let secret_name = secret
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "secret.bin".into());
+
+    let mut file_id = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut file_id);
+    let key = file_key(master, &file_id);
+
+    let name = secret_name.as_bytes();
+    if name.len() > u16::MAX as usize {
+        return Err(Error::InvalidInput("secret filename too long".into()));
+    }
+    let mut payload = Zeroizing::new(Vec::with_capacity(2 + name.len() + secret_bytes.len()));
+    payload.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    payload.extend_from_slice(name);
+    payload.extend_from_slice(&secret_bytes);
+    let blob = crypto::encrypt(&key, &payload, AAD_STEG)?;
+
+    let mut hidden = Vec::with_capacity(16 + blob.len());
+    hidden.extend_from_slice(&file_id);
+    hidden.extend_from_slice(&blob);
+
+    let mut out = carrier_bytes;
+    out.extend_from_slice(&hidden);
+    out.extend_from_slice(&(hidden.len() as u64).to_be_bytes());
+    out.extend_from_slice(STEG_MAGIC);
+    fs::write(output, out)?;
+    Ok(())
+}
+
+/// Whether a file has a TrezorProtector hidden payload appended.
+pub fn has_hidden(container: &Path) -> bool {
+    let mut file = match fs::File::open(container) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    use std::io::{Seek, SeekFrom};
+    if file.seek(SeekFrom::End(-8)).is_err() {
+        return false;
+    }
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic).is_ok() && &magic == STEG_MAGIC
+}
+
+/// Extract the hidden secret from a container. Returns
+/// (carrier_bytes, secret_name, secret_bytes).
+pub fn extract_hidden(
+    master: &SecretKey,
+    container: &Path,
+) -> Result<(Vec<u8>, String, Zeroizing<Vec<u8>>)> {
+    let raw = fs::read(container)?;
+    if raw.len() < 16 || &raw[raw.len() - 8..] != STEG_MAGIC {
+        return Err(Error::InvalidInput(
+            "no hidden TrezorProtector payload in this file".into(),
+        ));
+    }
+    let len_pos = raw.len() - 16;
+    let hidden_len = u64::from_be_bytes(raw[len_pos..raw.len() - 8].try_into().unwrap()) as usize;
+    if hidden_len < 16 || hidden_len > len_pos {
+        return Err(Error::Crypto("corrupt hidden-payload trailer".into()));
+    }
+    let hidden_start = len_pos - hidden_len;
+    let hidden = &raw[hidden_start..len_pos];
+    let carrier = raw[..hidden_start].to_vec();
+
+    let file_id: [u8; 16] = hidden[..16].try_into().unwrap();
+    let key = file_key(master, &file_id);
+    let payload = crypto::decrypt(&key, &hidden[16..], AAD_STEG)
+        .map_err(|_| Error::Crypto("wrong device or corrupt hidden payload".into()))?;
+    if payload.len() < 2 {
+        return Err(Error::Crypto("corrupt hidden payload".into()));
+    }
+    let name_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+    if payload.len() < 2 + name_len {
+        return Err(Error::Crypto("corrupt hidden payload".into()));
+    }
+    let name = safe_basename(&String::from_utf8_lossy(&payload[2..2 + name_len]));
+    let secret = Zeroizing::new(payload[2 + name_len..].to_vec());
+    Ok((carrier, name, secret))
+}
+
+// ---------------------------------------------------------------------------
 // Secure delete
 // ---------------------------------------------------------------------------
 
@@ -438,6 +553,36 @@ mod tests {
         assert_eq!(safe_basename("..\\..\\evil.exe"), "evil.exe");
         assert_eq!(safe_basename(".."), "restored.bin");
         assert_eq!(safe_basename(""), "restored.bin");
+    }
+
+    #[test]
+    fn stego_roundtrip_and_carrier_intact() {
+        let dir = tmpdir();
+        let carrier = dir.join("photo.jpg");
+        let carrier_data = b"\xff\xd8\xff\xe0 pretend JPEG bytes \xff\xd9".to_vec();
+        fs::write(&carrier, &carrier_data).unwrap();
+        let secret = dir.join("plan.txt");
+        fs::write(&secret, b"the hidden plan").unwrap();
+
+        let master = SecretKey::generate();
+        let container = dir.join("out.jpg");
+        embed_hidden(&master, &carrier, &secret, &container).unwrap();
+
+        // Container still starts with the carrier bytes (opens as a JPEG).
+        let container_bytes = fs::read(&container).unwrap();
+        assert!(container_bytes.starts_with(&carrier_data));
+        assert!(has_hidden(&container));
+        assert!(!has_hidden(&carrier));
+
+        let (recovered_carrier, name, secret_bytes) =
+            extract_hidden(&master, &container).unwrap();
+        assert_eq!(recovered_carrier, carrier_data);
+        assert_eq!(name, "plan.txt");
+        assert_eq!(&secret_bytes[..], b"the hidden plan");
+
+        // Wrong device can't extract.
+        assert!(extract_hidden(&SecretKey::generate(), &container).is_err());
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

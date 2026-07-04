@@ -3632,7 +3632,7 @@ checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
 name = "tp-cli"
-version = "2.0.0"
+version = "2.2.0"
 dependencies = [
  "arboard",
  "clap",
@@ -3649,7 +3649,7 @@ dependencies = [
 
 [[package]]
 name = "tp-core"
-version = "2.0.0"
+version = "2.2.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3671,19 +3671,20 @@ dependencies = [
 
 [[package]]
 name = "tp-gui"
-version = "2.0.0"
+version = "2.2.0"
 dependencies = [
  "arboard",
  "eframe",
  "rfd",
  "tp-core",
+ "windows",
  "winresource",
  "zeroize",
 ]
 
 [[package]]
 name = "tp-host"
-version = "2.0.0"
+version = "2.2.0"
 dependencies = [
  "serde",
  "serde_json",

@@ -44,6 +44,12 @@ pub struct DeviceInfo {
     pub initialized: bool,
 }
 
+/// Quick check for whether any Trezor is currently plugged in, without
+/// opening a session. Used by the desktop app to enforce lock-on-disconnect.
+pub fn device_present() -> bool {
+    !trezor_client::find_devices(false).is_empty()
+}
+
 pub struct TrezorManager {
     client: Trezor,
 }

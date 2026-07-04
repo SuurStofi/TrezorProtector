@@ -7,11 +7,15 @@
 //! * `tp-gui passphrase` — passphrase dialog (empty line = on-device)
 //! * `tp-gui connect` — "connect your Trezor" retry prompt
 
-#![forbid(unsafe_code)]
+// `deny` (not `forbid`) so the single, audited platform module can opt into
+// `unsafe` for the Win32 screen-capture-exclusion calls; everything else
+// stays unsafe-free.
+#![deny(unsafe_code)]
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
 mod dialogs;
+mod platform;
 mod worker;
 
 fn main() -> eframe::Result {

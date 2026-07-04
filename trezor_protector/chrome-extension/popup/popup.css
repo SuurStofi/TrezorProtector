@@ -80,7 +80,45 @@ input:focus, select:focus, button:focus { outline: 1px solid var(--accent); }
   border-radius: 8px;
   padding: 8px 10px;
 }
-.entry .top { display: flex; justify-content: space-between; align-items: baseline; }
+.entry .top { display: flex; justify-content: flex-start; align-items: center; gap: 8px; }
+.entry .top .name { flex: 1; }
+
+.tile {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  border-radius: 5px;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.folder { margin: 2px 0; }
+.folder > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  padding: 6px 8px;
+  border-radius: 8px;
+  list-style: none;
+  user-select: none;
+}
+.folder > summary::-webkit-details-marker { display: none; }
+.folder > summary:hover { background: var(--panel); }
+.folder-count {
+  margin-left: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0 7px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.entry.in-folder { margin-left: 14px; border-left: 2px solid var(--border); }
 .entry .name { font-weight: 600; }
 .entry .user { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
 .entry .actions { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }

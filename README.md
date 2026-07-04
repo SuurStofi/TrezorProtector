@@ -65,8 +65,17 @@ Brave and Edge on Linux, plus Chrome/Chromium on macOS.
 - Browse/search entries, reveal or copy passwords (auto-clearing clipboard),
   live 2FA codes, password history.
 - Add, edit, delete entries; built-in generator (passwords & passphrases).
-- Encrypt/decrypt files via the file picker.
-- Auto-locks after 5 idle minutes; keys are zeroized on lock.
+- **Domain folders**: a site with several accounts collapses into one folder;
+  local colored letter tiles (no favicons fetched) for quick scanning.
+- Batch-encrypt files (import several at once), decrypt, or **Encrypt as…**
+  a custom name/extension (e.g. `notes.pdf`) for a low-key masquerade.
+- **Settings**: per-operation confirmation (re-locks after each copy),
+  lock-on-unplug, anti-RAT screen-capture exclusion (live toggle), auto-lock
+  and clipboard timers.
+- Picks up passwords the browser extension saved automatically (no reconnect
+  needed); re-locks the moment the Trezor is unplugged.
+- Auto-locks after 5 idle minutes; keys are zeroized on lock and pinned in
+  RAM against swap.
 
 It also provides the dialog windows the Chrome flow uses: when the browser
 needs an unlock, `tp-host` opens `tp-gui`'s **native** connect/PIN/passphrase
@@ -95,7 +104,19 @@ tp vault export backup.tpbackup  # password-protected recovery file
                                  # (works even if the Trezor is lost!)
 tp vault import backup.tpbackup
 tp vault rotate-key              # re-wrap everything under a fresh key
+tp vault recovery-setup          # print a 24-word phrase to re-bind a new
+                                 #   Trezor if this one is lost
+tp vault recover                 # bind the vault to a new device via phrase
 tp migrate                       # upgrade a v1 (Python) vault in place
+
+tp settings                      # show settings
+tp settings auto_lock_minutes 15 # change one
+
+# Steganographic dropper — hide a file inside a normal-looking carrier
+tp stego embed --carrier photo.jpg --secret plan.txt -o holiday.jpg
+#   holiday.jpg opens as a normal photo; only the next command reveals it:
+tp stego open holiday.jpg        # writes plan.txt (needs the Trezor)
+tp stego check holiday.jpg       # is there a hidden payload? (no device needed)
 ```
 
 Global: `--vault <path>` or `TREZOR_PROTECTOR_VAULT` env var.

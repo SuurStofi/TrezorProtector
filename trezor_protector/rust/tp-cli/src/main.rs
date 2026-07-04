@@ -70,6 +70,10 @@ enum Command {
     /// File encryption
     #[command(subcommand)]
     File(FileCommand),
+    /// Steganographic dropper: hide an encrypted file inside a normal-looking
+    /// carrier (PDF/JPEG/ZIP…) that still opens normally in its own app
+    #[command(subcommand)]
+    Stego(StegoCommand),
     /// Vault maintenance: backup, restore, key rotation
     #[command(subcommand)]
     Vault(VaultCommand),
@@ -216,6 +220,31 @@ enum FileCommand {
 }
 
 #[derive(Subcommand)]
+enum StegoCommand {
+    /// Hide a secret file inside a carrier file
+    Embed {
+        /// The innocuous carrier (opens normally): e.g. photo.jpg, report.pdf
+        #[arg(long)]
+        carrier: PathBuf,
+        /// The secret file to hide inside it
+        #[arg(long)]
+        secret: PathBuf,
+        /// Output container path (defaults to <carrier stem>-out.<ext>)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Reveal and save the hidden file from a container (needs the Trezor)
+    Open {
+        container: PathBuf,
+        /// Directory to write the revealed file into (default: alongside it)
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+    },
+    /// Check whether a file has a hidden TrezorProtector payload
+    Check { file: PathBuf },
+}
+
+#[derive(Subcommand)]
 enum VaultCommand {
     /// Export all entries into a password-protected backup
     /// (Argon2id + AES-256-GCM вЂ” recoverable WITHOUT the Trezor)
@@ -270,9 +299,49 @@ fn run(cli: Cli) -> Result<()> {
         Command::Totp { query, copy } => cmd_totp(&vault_path, &query, copy),
         Command::Audit { days, hibp } => cmd_audit(&vault_path, days, hibp),
         Command::File(cmd) => cmd_file(&vault_path, cmd),
+        Command::Stego(cmd) => cmd_stego(&vault_path, cmd),
         Command::Vault(cmd) => cmd_vault(&vault_path, cmd),
         Command::Settings { key, value } => cmd_settings(key, value),
     }
+}
+
+fn cmd_stego(vault_path: &Path, cmd: StegoCommand) -> Result<()> {
+    // `check` needs neither the vault nor the device.
+    if let StegoCommand::Check { file } = &cmd {
+        if files::has_hidden(file) {
+            println!("{} hidden payload present.", "Yes:".green().bold());
+        } else {
+            println!("No hidden TrezorProtector payload found.");
+        }
+        return Ok(());
+    }
+
+    let (master, _unlocked) = interact::unlock(vault_path)?;
+    match cmd {
+        StegoCommand::Embed { carrier, secret, output } => {
+            let out = output.unwrap_or_else(|| {
+                let ext = carrier.extension().and_then(|e| e.to_str()).unwrap_or("bin");
+                let stem = carrier.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+                carrier.with_file_name(format!("{stem}-out.{ext}"))
+            });
+            files::embed_hidden(&master, &carrier, &secret, &out)?;
+            println!("{} {}", "Container written:".green().bold(), out.display());
+            println!("It opens normally as a {} file; only `tp stego open` (with your",
+                out.extension().and_then(|e| e.to_str()).unwrap_or("carrier"));
+            println!("Trezor) reveals the hidden '{}'.", secret.display());
+        }
+        StegoCommand::Open { container, out_dir } => {
+            let (_carrier, name, secret) = files::extract_hidden(&master, &container)?;
+            let dir = out_dir.unwrap_or_else(|| {
+                container.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+            });
+            let dst = dir.join(&name);
+            std::fs::write(&dst, &secret[..])?;
+            println!("{} {}", "Revealed:".green().bold(), dst.display());
+        }
+        StegoCommand::Check { .. } => unreachable!("handled above"),
+    }
+    Ok(())
 }
 
 fn cmd_settings(key: Option<String>, value: Option<String>) -> Result<()> {

@@ -95,6 +95,7 @@ struct Session {
     last_activity: Instant,
     autolock: Duration,
     vault_path: PathBuf,
+    vault_mtime: Option<std::time::SystemTime>,
 }
 
 impl Session {
@@ -106,6 +107,7 @@ impl Session {
             vault_path: std::env::var_os("TREZOR_PROTECTOR_VAULT")
                 .map(PathBuf::from)
                 .unwrap_or_else(vault::default_path),
+            vault_mtime: None,
         }
     }
 
@@ -121,6 +123,19 @@ impl Session {
         }
         self.last_activity = Instant::now();
         self.unlocked.as_mut()
+    }
+
+    /// If the vault file changed on disk since we last read it (e.g. the
+    /// desktop app added an entry), re-decrypt it with the key we already
+    /// hold so reads see fresh data.
+    fn refresh_if_changed(&mut self) {
+        let current = vault::file_mtime(&self.vault_path);
+        if current != self.vault_mtime {
+            if let Some(v) = self.unlocked.as_mut() {
+                let _ = v.reload();
+            }
+            self.vault_mtime = current;
+        }
     }
 }
 
@@ -183,6 +198,7 @@ fn handle(session: &mut Session, cmd: &str, msg: &Value, id: &Value) -> Result<V
             let count = unlocked.entries().len();
             session.unlocked = Some(unlocked);
             session.last_activity = Instant::now();
+            session.vault_mtime = vault::file_mtime(&session.vault_path);
             Ok(json!({ "ok": true, "entry_count": count }))
         }
 
@@ -192,6 +208,7 @@ fn handle(session: &mut Session, cmd: &str, msg: &Value, id: &Value) -> Result<V
         }
 
         "list" => {
+            session.refresh_if_changed();
             let query = msg.get("query").and_then(|q| q.as_str()).unwrap_or("");
             let vault = session
                 .vault()
@@ -213,6 +230,7 @@ fn handle(session: &mut Session, cmd: &str, msg: &Value, id: &Value) -> Result<V
         }
 
         "get" => {
+            session.refresh_if_changed();
             let entry_id = msg
                 .get("entry_id")
                 .and_then(|e| e.as_str())
@@ -234,6 +252,7 @@ fn handle(session: &mut Session, cmd: &str, msg: &Value, id: &Value) -> Result<V
         }
 
         "totp" => {
+            session.refresh_if_changed();
             let entry_id = msg
                 .get("entry_id")
                 .and_then(|e| e.as_str())
@@ -267,6 +286,7 @@ fn handle(session: &mut Session, cmd: &str, msg: &Value, id: &Value) -> Result<V
                 .ok_or_else(|| Error::Vault("locked".into()))?;
             let entry = vault::Entry::new(&name, &get("username"), &get("url"), &password, "");
             let entry_id = vault.add(entry)?;
+            session.vault_mtime = vault::file_mtime(&session.vault_path);
             Ok(json!({ "ok": true, "entry_id": entry_id }))
         }
 
@@ -288,6 +308,7 @@ fn handle(session: &mut Session, cmd: &str, msg: &Value, id: &Value) -> Result<V
             let mut patch = vault::EntryPatch::empty();
             patch.password = Some(password);
             vault.update(&entry_id, patch)?;
+            session.vault_mtime = vault::file_mtime(&session.vault_path);
             Ok(json!({ "ok": true }))
         }
 

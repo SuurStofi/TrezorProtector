@@ -161,12 +161,74 @@ async function loadEntries(query) {
     return;
   }
 
+  // Group by registrable domain; a site with several accounts becomes a
+  // collapsible folder for easier navigation.
+  const groups = new Map();
   for (const e of entriesCache) {
-    box.appendChild(renderEntry(e, matches(e)));
+    const key = domainKey(e);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(e);
+  }
+  const searching = $("#search").value.trim().length > 0;
+
+  for (const [domain, items] of groups) {
+    if (items.length === 1) {
+      box.appendChild(renderEntry(items[0], matches(items[0])));
+    } else {
+      box.appendChild(renderFolder(domain, items, matches, searching));
+    }
   }
 }
 
+function renderFolder(domain, items, matches, open) {
+  const details = document.createElement("details");
+  details.className = "folder";
+  if (open || items.some(matches)) details.open = true;
+
+  const summary = document.createElement("summary");
+  const tile = makeTile(domain);
+  const label = document.createElement("span");
+  label.textContent = `${domain}`;
+  const count = document.createElement("span");
+  count.className = "folder-count";
+  count.textContent = items.length;
+  summary.append(tile, label, count);
+  details.appendChild(summary);
+
+  for (const e of items) {
+    details.appendChild(renderEntry(e, matches(e), true));
+  }
+  return details;
+}
+
+// Deterministic colored letter tile (no network — nothing about your sites
+// leaves the machine).
+const TILE_COLORS = [
+  "#27b06c", "#4682dc", "#c87828", "#aa5ac8",
+  "#d25064", "#28aab4", "#96963c", "#6e6ec8",
+];
+function makeTile(basis) {
+  const host = (basis || "?").replace(/^.*:\/\//, "").replace(/^www\./, "");
+  const ch = (host.match(/[a-z0-9]/i) || ["?"])[0].toUpperCase();
+  let h = 2166136261;
+  for (let i = 0; i < host.length; i++) {
+    h = Math.imul(h ^ host.charCodeAt(i), 16777619) >>> 0;
+  }
+  const tile = document.createElement("span");
+  tile.className = "tile";
+  tile.style.background = TILE_COLORS[h % TILE_COLORS.length];
+  tile.textContent = ch;
+  return tile;
+}
+
+function domainKey(e) {
+  const host = hostnameLike(e.url) || (e.name || "").toLowerCase();
+  const labels = host.split(".").filter(Boolean);
+  return labels.length >= 2 ? labels.slice(-2).join(".") : host || e.name;
+}
+
 function hostnameLike(url) {
+  if (!url) return "";
   try { return new URL(url).hostname.toLowerCase(); }
   catch (_) {
     try { return new URL("https://" + url).hostname.toLowerCase(); }
@@ -174,18 +236,19 @@ function hostnameLike(url) {
   }
 }
 
-function renderEntry(e, siteMatch) {
+function renderEntry(e, siteMatch, inFolder = false) {
   const div = document.createElement("div");
-  div.className = "entry" + (siteMatch ? " site-match" : "");
+  div.className = "entry" + (siteMatch ? " site-match" : "") + (inFolder ? " in-folder" : "");
 
   const top = document.createElement("div");
   top.className = "top";
+  if (!inFolder) top.appendChild(makeTile(e.url || e.name));
   const name = document.createElement("span");
   name.className = "name";
-  name.textContent = e.name;
+  name.textContent = inFolder ? e.username || e.name : e.name;
   const user = document.createElement("span");
   user.className = "user";
-  user.textContent = e.username;
+  user.textContent = inFolder ? "" : e.username;
   top.append(name, user);
 
   const actions = document.createElement("div");
