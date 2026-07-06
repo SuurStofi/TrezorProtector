@@ -3,7 +3,7 @@ resolver = "2"
 members = ["tp-core", "tp-cli", "tp-host", "tp-gui"]
 
 [workspace.package]
-version = "2.2.0"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 
